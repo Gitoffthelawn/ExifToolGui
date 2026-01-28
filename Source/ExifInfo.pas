@@ -27,6 +27,7 @@ Olympus         Orf                       E-300
 Panasonic       Rw2                       DMC-FZ70, DMC-LX3
 Google          Jpg                       Pixel 7 Pro
 PhaseOne        Iiq                       Credo 40
+Apple           Heic                      IPhone 8, 12, 16
 *)
 
 interface
@@ -182,7 +183,7 @@ type
   TParseIFDProc = procedure(IFDentry: IFDentryRec) of object;
   TGetOption = (gmXMP, gmIPTC, gmGPS, gmICC);
   TGetOptions = set of TGetOption;
-  TSupportedType = (supJPEG, supTIFF, supCRW, supCR3);
+  TSupportedType = (supJPEG, supTIFF, supCRW, supCR3, SupHEIC);
   TSupportedTypes = set of TSupportedType;
 
   FotoRec = packed record
@@ -264,11 +265,10 @@ type
     procedure ReadTIFF;
     procedure ReadJPEG;
     procedure ReadXMP;
-    function SkipCr3Header: word;
-    procedure ReadCr3;
+    procedure ReadCr3OrHeic;
+    function ReadFtyp(StartOffs: int64 = 0): word;
     function SkipFujiHeader: word;
     procedure ReadFuji;
-
   end;
 
   TMetaData = class(TObject)
@@ -626,6 +626,8 @@ begin
   ICC.Clear;
 
   Self := Default(FotoRec);
+  IFD0.OrientationValue := $ffff; // Meaning: For a supported file format there is no orientation. Guess from Width and Height
+
   SetLength(XmpSize, 0);
   SetLength(XMPoffset, 0);
 end;
@@ -1158,7 +1160,6 @@ begin
   end;
   FotoF.Seek(SavePos, TSeekOrigin.soBeginning);
 end;
-
 
 procedure FotoRec.ParseMakerNotes(Offset: int64);
 var
@@ -2256,8 +2257,10 @@ begin
       Setlength(Bytes, XMPsize[Index]);
       FotoF.Read(Bytes[0], XMPsize[Index]);
       TmpStream.WriteData(Bytes, XMPsize[Index]);
-      if (Index = 0) and
-         (TmpStream.Size > XMPMINSIZE)then // Process standard XMP
+      // XMP blocks from HEIC are complete XML docs.
+      // Others need to be merged to one XML doc. (EG Standard + Extended)
+      if ( (Index = 0) or (Supported = [SupHEIC]) ) and
+         (TmpStream.Size > XMPMINSIZE) then // Process standard XMP
       begin
 {$IFDEF DEBUG_XMP}
         TmpStream.SaveToFile(ChangeFileExt(Self.FileName, '.XML'));
@@ -2280,112 +2283,236 @@ begin
   end;
 end;
 
-// https://github.com/lclevy/canon_cr3/blob/master/readme.md
-// If it's a CR3, skip until we see a CMT1. Thats the IFD0
-function FotoRec.SkipCr3Header: word;
+// Common code for CR3 and HEIC.
+// If it's a CR3, skip until we see a CMT1. Thats the IFD0. https://github.com/lclevy/canon_cr3/blob/master/readme.md
+// For Heic look in the iloc, if there's Exif or XMP data.
+// Returns $4d4d (IsMM = true), or $4949 (IsMM = false)
+function FotoRec.ReadFtyp(StartOffs: int64 = 0): word;
+type
+
+  TFtypTag = packed record
+    TagLen: DWORD;
+    TagName:array[0..3] of AnsiChar;
+  end;
+
+  TExifOrXMpTag = packed record
+    case boolean of
+    true:  // 0x00 00 00 06 'Exif'
+      (
+        TagLen: DWORD;
+        TagName:array[0..3] of AnsiChar;
+      );
+    false: // '<x:xmpmeta'
+      (
+        XMpName:array[0..9] of AnsiChar;
+      );
+  end;
+  TItemLoc = packed record
+    ID: WORD;
+    ConstructMethod: WORD;
+    BaseOffset: WORD;
+    ExtentCount: WORD;
+    Offset: DWORD;
+    Len: DWORD;
+  end;
+
+  function FindExifAndXmp(StartOffs: int64): WORD;
+  var
+    ItemLoc: TItemLoc;
+    Version: byte;
+    Item, ItemCnt: Word;
+    Flags: array[0..2] of byte;
+    SizeSpecifiers: array[0..1] of byte;
+    SavPos: int64;
+    ExifOrXmpTag: TExifOrXMpTag;
+  begin
+    result := 0;
+    FotoF.Seek(StartOffs, TSeekOrigin.soBeginning);
+    FotoF.Read(Version, SizeOf(Version));
+
+    // Can't handle version 2
+    if (Version > 1) then
+      exit;
+
+    FotoF.Read(Flags, SizeOf(Flags));
+    FotoF.Read(SizeSpecifiers, SizeOf(SizeSpecifiers));
+
+    // Sizes must be as expected
+    if (SizeSpecifiers[0] <> $44) then
+      exit;
+
+    FotoF.Read(ItemCnt, SizeOf(ItemCnt));
+    for Item := 1 to ItemCnt do
+    begin
+      FotoF.Read(ItemLoc, SizeOf(ItemLoc));
+      ItemLoc.ID := Swap(ItemLoc.ID);
+      ItemLoc.ConstructMethod := Swap(ItemLoc.ConstructMethod);
+      ItemLoc.BaseOffset := Swap(ItemLoc.BaseOffset);
+      ItemLoc.ExtentCount := Swap(ItemLoc.ExtentCount);
+      ItemLoc.Offset := SwapL(ItemLoc.Offset);
+      ItemLoc.Len := SwapL(ItemLoc.Len);
+
+      // Offset must be from start of file
+      if (ItemLoc.ConstructMethod <> 0) then
+        continue;
+
+      // Does this point to an Exif, or XMP?
+      // Save current position
+      SavPos := FotoF.Position;
+      try
+        FillChar(ExifOrXmpTag,  SizeOf(ExifOrXmpTag), 0);
+        FotoF.Seek(ItemLoc.Offset, TSeekOrigin.soBeginning);
+        FotoF.Read(ExifOrXmpTag, SizeOf(ExifOrXmpTag));
+
+        // Check Exif
+        if (SwapL(ExifOrXmpTag.TagLen) = 6) and
+           (ExifOrXmpTag.TagName = 'Exif') then
+        begin
+          Include(Supported,  TSupportedType.SupHEIC);
+          ExifIFDoffset := FotoF.Position;
+          FotoF.Read(result, SizeOf(result));
+        end;
+
+        // Check XMP
+        if (ExifOrXmpTag.XMpName = '<x:xmpmeta') then
+          AddXmpBlock(ItemLoc.Offset, ItemLoc.Len);
+      finally
+        // Restore file pointer
+        FotoF.Position := SavPos;
+      end;
+    end;
+  end;
+
 var
-  SavePos, EndPos: Int64;
-  Cr3Magic:array[0..6] of AnsiChar;
-  TagLen: DWORD;
-  TagName:array[0..3] of AnsiChar;
+  Tag: TFtypTag;
+  Version: byte;
+  Flags: array[0..2] of byte;
+  EndPos: Int64;
 
 const
   MoovSize = 24;
-  TiffHeader = 8;
+
 begin
   result := WordData;
-  SavePos := FotoF.Position;
-  FotoF.Seek(4, TSeekOrigin.soBeginning);
-  FotoF.Read(Cr3Magic, SizeOf(Cr3Magic));
+  FotoF.Seek(StartOffs, TSeekOrigin.soBeginning);
+  Fillchar(Tag, Sizeof(tag), 0);
 
-  if (Cr3Magic = 'ftypcrx') then
+  if (StartOffs = 0) then
   begin
-    FotoF.Seek(0, TSeekOrigin.soBeginning);
-    FotoF.Read(TagLen, SizeOf(TagLen));
-    TagLen := SwapL(TagLen) - SizeOf(TagLen) - SizeOf(TagName);
-    FotoF.Read(TagName, SizeOf(TagName));
-    EndPos := FileSize;
-    while (FotoF.Position + TagLen <  EndPos) do
+    FotoF.Read(Tag, SizeOf(Tag));
+    Tag.TagLen := SwapL(Tag.TagLen) - SizeOf(Tag);
+    if (Tag.TagName <> 'ftyp') then
+      exit;
+  end;
+
+  FotoF.Seek(Tag.TagLen, TSeekOrigin.soCurrent);
+  EndPos := FileSize;
+  while (FotoF.Position + SizeOf(Tag) <  EndPos) do
+  begin
+    FotoF.Read(Tag, SizeOf(Tag));
+    Tag.TagLen := SwapL(Tag.TagLen) - SizeOf(Tag);
+    if (Tag.TagName = 'moov') then
     begin
-      if (TagName = 'moov') then
-      begin
-        EndPos := Fotof.Position + TagLen;
-        Fotof.Seek(MoovSize, TSeekOrigin.soCurrent);
-      end
-      else
-        FotoF.Seek(TagLen, TSeekOrigin.soCurrent);
-
-      FotoF.Read(TagLen, SizeOf(TagLen));
-      TagLen := SwapL(TagLen) - SizeOf(TagLen) - SizeOf(TagName);
-      FotoF.Read(TagName, SizeOf(TagName));
-
-      if (TagName = 'CMT1') then
-      begin
-        FotoF.Read(result, SizeOf(result)); // Return first word.
-        result := Swap(result);
-        break;
-      end;
+      EndPos := Fotof.Position + Tag.TagLen;
+      Fotof.Seek(MoovSize, TSeekOrigin.soCurrent);
+      continue;
+    end
+    else if (Tag.TagName = 'CMT1') then
+    begin
+      Include(Supported,  TSupportedType.supCR3);
+      FotoF.Read(result, SizeOf(result)); // Return first word.
+      result := Swap(result);
+      break;
+    end
+    else if (Tag.TagName = 'meta') then
+    begin
+      // Version and Flags are future use
+      FotoF.Read(Version, SizeOf(Version));
+      FotoF.Read(Flags, SizeOf(Flags));
+      result := ReadFtyp(FotoF.Position);
+      break;
+    end
+    else if (Tag.TagName = 'iloc') then
+    begin
+      result := FindExifAndXmp(FotoF.Position);
+      break;
     end;
-  end
-  else
-    FotoF.Seek(SavePos, TSeekOrigin.soBeginning); // No CR3
+    FotoF.Seek(Tag.TagLen, TSeekOrigin.soCurrent);
+  end;
+
+  // No Ftyp
+  if (result = 0) then
+    FotoF.Seek(0, TSeekOrigin.soBeginning);
 end;
 
 // Loop thru the tag names
 // CMT1, CMT2, CMT4 are TIFF IFD's
 // uuid with magic #$be + #$7a + #$cf + #$cb is XMP
-procedure FotoRec.ReadCr3;
+procedure FotoRec.ReadCr3OrHeic;
 var
   EndPos: Int64;
   XmpMagic:array[0..3] of AnsiChar;
   TagLen: DWORD;
   TagName:array[0..3] of AnsiChar;
-
 const
   TiffHeaderLen = 8;
   UuidLen = 16;
   CMT1Len = 10;
 begin
-  if (SkipCr3Header <> $4949) then // No CR3
-    exit;
-  IsMM := false;
-
-  Include(Supported, TSupportedType.supCR3);
-  FotoF.Seek(-CMT1Len, TSeekOrigin.soCurrent); //position before CMT1 to get the len
-
-  FotoF.Read(TagLen, SizeOf(TagLen));
-  TagLen := SwapL(TagLen) - SizeOf(TagLen) - SizeOf(TagName);
-  FotoF.Read(TagName, SizeOf(TagName));
-  EndPos := FileSize;
-  while (FotoF.Position + TagLen < EndPos) do
+  ISMM := (ReadFtyp = $4d4d);
+  if (Supported = [TSupportedType.SupHEIC]) then
   begin
-    TIFFoffset := FotoF.Position;
-    FotoF.Read(WordData, SizeOf(WordData));
-    if (TagName = 'CMT1') then
-      ParseIfd(TIFFoffset + TiffHeaderLen, ParseIFD0);
-    if (TagName = 'CMT2') then
-      ParseIfd(TIFFoffset + TiffHeaderLen, ParseExifIFD);
+    TIFFoffset := ExifIFDoffset;
+    ParseIfd(TIFFoffset + TiffHeaderLen, ParseIFD0);
+
+    // ParseIFD0 can set ExifIFDoffset/GPSoffset
+    if ExifIFDoffset > 0 then
+      ParseIFD(TIFFoffset + ExifIFDoffset, ParseExifIFD);
+
     if (TGetOption.gmGPS in GetOptions) and
-       (TagName = 'CMT4') then
-      ParseIfd(TIFFoffset + TiffHeaderLen, ParseGPS);
-    if (TGetOption.gmXMP in GetOptions)and
-       (TagName = 'uuid') then
-    begin
-      FotoF.Seek(-SizeOf(WordData), TSeekOrigin.soCurrent);
-      FotoF.Read(XmpMagic, SizeOf(XmpMagic));
-      if XmpMagic = #$be + #$7a + #$cf + #$cb then
-        AddXmpBlock(UuidLen + TIFFoffset, TagLen - UuidLen);
-    end;
+       (GPSoffset > 0) then
+      ParseIFD(TIFFoffset + GPSoffset, ParseGPS);
 
-    FotoF.Seek(TIFFoffset + TagLen, TSeekOrigin.soBeginning);
+    // ReadXMP is handled in GetMetadata
+  end
+  else if (Supported = [TSupportedType.supCR3]) then
+  begin
+    FotoF.Seek(-CMT1Len, TSeekOrigin.soCurrent); //position before CMT1 to get the len
+
     FotoF.Read(TagLen, SizeOf(TagLen));
+    TagLen := SwapL(TagLen) - SizeOf(TagLen) - SizeOf(TagName);
     FotoF.Read(TagName, SizeOf(TagName));
+    EndPos := FileSize;
+    while (FotoF.Position + TagLen < EndPos) do
+    begin
+      TIFFoffset := FotoF.Position;
+      FotoF.Read(WordData, SizeOf(WordData));
+      if (TagName = 'CMT1') then
+        ParseIfd(TIFFoffset + TiffHeaderLen, ParseIFD0);
+      if (TagName = 'CMT2') then
+        ParseIfd(TIFFoffset + TiffHeaderLen, ParseExifIFD);
+      if (TGetOption.gmGPS in GetOptions) and
+         (TagName = 'CMT4') then
+        ParseIfd(TIFFoffset + TiffHeaderLen, ParseGPS);
+      if (TGetOption.gmXMP in GetOptions)and
+         (TagName = 'uuid') then
+      begin
+        FotoF.Seek(-SizeOf(WordData), TSeekOrigin.soCurrent);
+        FotoF.Read(XmpMagic, SizeOf(XmpMagic));
+        if XmpMagic = #$be + #$7a + #$cf + #$cb then
+          AddXmpBlock(UuidLen + TIFFoffset, TagLen - UuidLen);
+      end;
 
-    TagLen := SwapL(TagLen);
-    if (TagLen > (SizeOf(TagLen) + SizeOf(TagName))) then
-      TagLen := TagLen - SizeOf(TagLen) - SizeOf(TagName)
-    else
-      TagLen := EndPos;
+      FotoF.Seek(TIFFoffset + TagLen, TSeekOrigin.soBeginning);
+      FotoF.Read(TagLen, SizeOf(TagLen));
+      FotoF.Read(TagName, SizeOf(TagName));
+
+      TagLen := SwapL(TagLen);
+      if (TagLen > (SizeOf(TagLen) + SizeOf(TagName))) then
+        TagLen := TagLen - SizeOf(TagLen) - SizeOf(TagName)
+      else
+        TagLen := EndPos;
+    end;
   end;
 end;
 
@@ -2482,7 +2609,7 @@ begin
           WordData := Swap(WordData);
           case WordData of
             $0000:
-              ReadCr3;  // CR3
+              ReadCr3OrHeic;  // CR3
             $4655:
               ReadFuji; // RAF
             $FFD8:

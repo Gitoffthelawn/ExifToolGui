@@ -1053,6 +1053,13 @@ begin
   end;
 end;
 
+// Dont rotate the HEIC container format.
+// The Codec does that automatically based on 'irot'.
+function HeicContainerGuid: TGuid;
+begin
+  result := StringToGuid('{E1E62521-6787-405B-A339-500715B5763F}');
+end;
+
 function WicPreview(AImg: string; Rotate, MaxW, MaxH: cardinal): IWICBitmapSource;
 var
   Hr: HRESULT;
@@ -1062,6 +1069,7 @@ var
   W, H: cardinal;
   NewW, NewH: integer;
   Portrait: boolean;
+  ContainerFormat: TGUID;
 begin
   result := nil;
 
@@ -1075,6 +1083,7 @@ begin
      (IwD = nil) then
     exit;
 
+  Iwd.GetContainerFormat(ContainerFormat); // For capabilities
   IwD.GetPreview(result);
   if (result = nil) then // Preview not supported, get real
     IwD.GetFrame(0, IWICBitmapFrameDecode(result));
@@ -1089,8 +1098,8 @@ begin
   if (W = 0) or (H = 0) then
     exit;
 
-  Portrait :=(Rotate = 90) or
-             (Rotate = 270);
+  Portrait := (ContainerFormat <> HeicContainerGuid) and
+              ( (Rotate = 90) or (Rotate = 270));
 
   NewSizeRetainRatio(W, H, MaxW, MaxH, NewW, NewH, Portrait);
 
@@ -1102,7 +1111,8 @@ begin
   IwdS.Initialize(result, NewW, NewH, WICBitmapInterpolationModeNearestNeighbor);
   result := IwdS;
 
-  if (Rotate <> 0) then
+  if (ContainerFormat <> HeicContainerGuid) and
+     (Rotate <> 0) then
   begin
     GlobalImgFact.CreateBitmapFlipRotator(IwdR);
     if (IwdR = nil) then

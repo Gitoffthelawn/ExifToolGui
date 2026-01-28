@@ -2975,6 +2975,9 @@ begin
     begin
       Foto := GetMetadata(FPath, []);
       case Foto.IFD0.OrientationValue of
+        $ffff:
+          if (Foto.Supported <> []) then // The file type is supported, but no orientation was found
+            RotateImg.Rotate := -1;      // Do it based on image dimensions. Width <=> Height
         0, 1:
           RotateImg.Rotate := 0; // no tag or don't rotate
         3:
