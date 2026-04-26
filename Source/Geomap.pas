@@ -153,12 +153,14 @@ const
   OSMMapLayer: TMapLayer
                     =   (ClassName: 'OSM.Mapnik';         Description: 'Mapnik');
 
-  XYZMapLayers:  array[0..0] of TMapLayer
-                    = ( (ClassName: 'XYZ.OpenTopoMap';    Description: 'Open Topo Map')
+  XYZMapLayers:  array[0..1] of TMapLayer
+                    = ( (ClassName: 'XYZ.OpenTopoMap';    Description: 'Open Topo Map'),
+                        (ClassName: 'XYZ.TOPPlusOpen';    Description: 'Top Plus Open')
                       );
 
-  MapTilerLayers:  array[0..5] of TMapTilerLayer
-                    = ( (Resource: 'tiles'; Style: 'satellite-v2';  Description: 'Map Tiler Satellite'),
+  MapTilerLayers:  array[0..6] of TMapTilerLayer
+                    = ( (Resource: 'maps';  Style: 'satellite-v4';  Description: 'Map Tiler Satellite'),
+                        (Resource: 'maps';  Style: 'hybrid-v4';     Description: 'Map Tiler Hybrid'),
                         (Resource: 'maps';  Style: 'base-v4';       Description: 'Map Tiler Base'),
                         (Resource: 'maps';  Style: 'openstreetmap'; Description: 'Map Tiler OpenStreetMap'),
                         (Resource: 'maps';  Style: 'streets-v4';    Description: 'Map Tiler Streets'),
@@ -686,6 +688,8 @@ begin
   Html.Add('var style;');
   Html.Add('var po;');
   Html.Add('var op;');
+  Html.Add('var defTileSize;');   // Default tileSize = (256, 256)
+  Html.Add('var cacheWrite, cacheRead;');
   Html.Add('');
   Html.Add('  function initialize()');
   Html.Add('  {');
@@ -701,6 +705,16 @@ begin
   Html.Add('           projection:       new OpenLayers.Projection("EPSG:900913"),');
   Html.Add('           displayProjection:new OpenLayers.Projection("EPSG:4326")});');
   Html.Add('');
+
+  // Save default tileSize
+  Html.Add('     defTileSize = map.tileSize;');
+
+  // Add Cache
+  Html.Add('     cacheWrite = new OpenLayers.Control.CacheWrite();');
+  Html.Add('     map.addControl(cacheWrite);');
+  Html.Add('     cacheRead = new OpenLayers.Control.CacheRead();');
+  Html.Add('     map.addControl(cacheRead);');
+
   // Add Mapnik layer
   Html.Add('     var BaseLayers = new Array();');
   Html.Add(Format('     map.addLayer(BaseLayers[BaseLayers.push(new OpenLayers.Layer.%s("%s")) -1]);',
@@ -734,9 +748,14 @@ begin
                [AMapLayer.ClassName, AMapLayer.Description]));
 
     if (GEOsettings.MapTilerKey <> '') then
+    begin
+      // MapTiler tiles are 512x512!
+      Html.Add('     map.tileSize = new OpenLayers.Size(512, 512);');
       for AMapTilerLayer in MapTilerLayers do
         Html.Add(Format('     map.addLayer(BaseLayers[BaseLayers.push(new OpenLayers.Layer.XYZ.MapTiler("%s", "%s", "%s", "%s")) -1]);',
                  [AMapTilerLayer.Description, AMapTilerLayer.Resource, AMapTilerLayer.Style, GEOsettings.MapTilerKey]));
+      Html.Add('     map.tileSize = defTileSize;');
+    end;
 
     // Select Base layer
     Html.Add(Format('     map.setBaseLayer(map.getLayersBy("name", "%s")[0]);',
