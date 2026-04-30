@@ -38,6 +38,7 @@ uses System.Classes, System.SysUtils, System.Generics.Collections, System.Types,
      ExifToolsGUI_StringList, ExifToolsGui_Dictionary;
 
 type
+
   TMakerNotes = (None, Cr2, Pentax, Nikon);
   TMetaInfo = variant;
   TVarData = TDictionary<string, TMetaInfo>;
@@ -156,6 +157,7 @@ type
 const
   RDFLI = 'rdf:li';
   RDFBAG = 'rdf:Bag';
+  RDFSEQ = 'rdf:Seq';
 
 type
   XMPrec = packed record
@@ -188,6 +190,33 @@ type
     ProfileCreator: string[4];
     ProfileDescription: string[31];
     procedure Clear;
+  end;
+
+// CR3 and Heic defs
+  TFtypTag = packed record
+    TagLen: DWORD;
+    TagName:array[0..3] of AnsiChar;
+  end;
+
+  TExifOrXMpTag = packed record
+    case boolean of
+    true:  // 0x00 00 00 06 'Exif'
+      (
+        TagLen: DWORD;
+        TagName:array[0..3] of AnsiChar;
+      );
+    false: // '<x:xmpmeta'
+      (
+        XMpName:array[0..9] of AnsiChar;
+      );
+  end;
+  TItemLoc = packed record
+    ID: WORD;
+    ConstructMethod: WORD;
+    BaseOffset: WORD;
+    ExtentCount: WORD;
+    Offset: DWORD;
+    Len: DWORD;
   end;
 
   TParseIFDProc = procedure(IFDentry: IFDentryRec) of object;
@@ -276,8 +305,9 @@ type
     procedure ReadTIFF;
     procedure ReadJPEG;
     procedure ReadXMP;
-    procedure ReadCr3OrHeic;
+    function FindExifAndXmp(StartOffs: int64): WORD;
     function ReadFtyp(StartOffs: int64 = 0): word;
+    procedure ReadCr3OrHeic;
     function SkipFujiHeader: word;
     procedure ReadFuji;
   end;
@@ -611,7 +641,8 @@ begin
   else if (ParmIsList) then
   begin
     if (SubNode <> RDFBAG) and
-       (SubNode <> RDFLI) then
+       (SubNode <> RDFLI) and
+       (SubNode <> RDFSEQ) then
     begin
       P := Pos(':', SubNode);
       if (P > 0) then
@@ -2385,7 +2416,7 @@ begin
          (TmpStream.Size > XMPMINSIZE) then // Process standard XMP
       begin
 {$IFDEF DEBUG_XMP}
-        TmpStream.SaveToFile(ChangeFileExt(Self.FileName, '.XML'));
+        TmpStream.SaveToFile(ChangeFileExt(Self.FileName, Format('.%d.XML', [Index])));
 {$ENDIF}
         ParseXMPBlock(TmpStream);
         TmpStream.Clear;
@@ -2406,118 +2437,93 @@ begin
 end;
 
 // Common code for CR3 and HEIC.
+
+// Locate the Exif and Xmp in the iloc. (HEIC)
+function FotoRec.FindExifAndXmp(StartOffs: int64): WORD;
+var
+  ItemLoc: TItemLoc;
+  Version: byte;
+  Item, ItemCnt: Word;
+  Flags: array[0..2] of byte;
+  SizeSpecifiers: array[0..1] of byte;
+  SavPos: int64;
+  ExifOrXmpTag: TExifOrXMpTag;
+begin
+  result := 0;
+  FotoF.Seek(StartOffs, TSeekOrigin.soBeginning);
+  FotoF.Read(Version, SizeOf(Version));
+
+  // Can't handle version 2
+  if (Version > 1) then
+    exit;
+
+  FotoF.Read(Flags, SizeOf(Flags));
+  FotoF.Read(SizeSpecifiers, SizeOf(SizeSpecifiers));
+
+  // Sizes must be as expected
+  if (SizeSpecifiers[0] <> $44) then
+    exit;
+
+  FotoF.Read(ItemCnt, SizeOf(ItemCnt));
+  for Item := 1 to ItemCnt do
+  begin
+    FotoF.Read(ItemLoc, SizeOf(ItemLoc));
+    ItemLoc.ID := Swap(ItemLoc.ID);
+    ItemLoc.ConstructMethod := Swap(ItemLoc.ConstructMethod);
+    ItemLoc.BaseOffset := Swap(ItemLoc.BaseOffset);
+    ItemLoc.ExtentCount := Swap(ItemLoc.ExtentCount);
+    ItemLoc.Offset := SwapL(ItemLoc.Offset);
+    ItemLoc.Len := SwapL(ItemLoc.Len);
+
+    // Offset must be from start of file
+    if (ItemLoc.ConstructMethod <> 0) then
+      continue;
+
+    // Does this point to an Exif, or XMP?
+    // Save current position
+    SavPos := FotoF.Position;
+    try
+      FillChar(ExifOrXmpTag,  SizeOf(ExifOrXmpTag), 0);
+      FotoF.Seek(ItemLoc.Offset, TSeekOrigin.soBeginning);
+      FotoF.Read(ExifOrXmpTag, SizeOf(ExifOrXmpTag));
+
+      // Check Exif
+      if (SwapL(ExifOrXmpTag.TagLen) = 6) and
+         (ExifOrXmpTag.TagName = 'Exif') then
+      begin
+        Include(Supported, TSupportedType.SupHEIC);
+        ExifIFDoffset := FotoF.Position;
+        FotoF.Read(result, SizeOf(result));
+      end;
+
+      // Check XMP
+      if (ExifOrXmpTag.XMpName = '<x:xmpmeta') then
+      begin
+        Include(Supported, TSupportedType.SupHEIC);
+        AddXmpBlock(ItemLoc.Offset, ItemLoc.Len);
+      end;
+    finally
+      // Restore file pointer
+      FotoF.Position := SavPos;
+    end;
+  end;
+end;
+
 // If it's a CR3, skip until we see a CMT1. Thats the IFD0. https://github.com/lclevy/canon_cr3/blob/master/readme.md
 // For Heic look in the iloc, if there's Exif or XMP data.
 // Returns $4d4d (IsMM = true), or $4949 (IsMM = false)
 function FotoRec.ReadFtyp(StartOffs: int64 = 0): word;
-type
-
-  TFtypTag = packed record
-    TagLen: DWORD;
-    TagName:array[0..3] of AnsiChar;
-  end;
-
-  TExifOrXMpTag = packed record
-    case boolean of
-    true:  // 0x00 00 00 06 'Exif'
-      (
-        TagLen: DWORD;
-        TagName:array[0..3] of AnsiChar;
-      );
-    false: // '<x:xmpmeta'
-      (
-        XMpName:array[0..9] of AnsiChar;
-      );
-  end;
-  TItemLoc = packed record
-    ID: WORD;
-    ConstructMethod: WORD;
-    BaseOffset: WORD;
-    ExtentCount: WORD;
-    Offset: DWORD;
-    Len: DWORD;
-  end;
-
-  function FindExifAndXmp(StartOffs: int64): WORD;
-  var
-    ItemLoc: TItemLoc;
-    Version: byte;
-    Item, ItemCnt: Word;
-    Flags: array[0..2] of byte;
-    SizeSpecifiers: array[0..1] of byte;
-    SavPos: int64;
-    ExifOrXmpTag: TExifOrXMpTag;
-  begin
-    result := 0;
-    FotoF.Seek(StartOffs, TSeekOrigin.soBeginning);
-    FotoF.Read(Version, SizeOf(Version));
-
-    // Can't handle version 2
-    if (Version > 1) then
-      exit;
-
-    FotoF.Read(Flags, SizeOf(Flags));
-    FotoF.Read(SizeSpecifiers, SizeOf(SizeSpecifiers));
-
-    // Sizes must be as expected
-    if (SizeSpecifiers[0] <> $44) then
-      exit;
-
-    FotoF.Read(ItemCnt, SizeOf(ItemCnt));
-    for Item := 1 to ItemCnt do
-    begin
-      FotoF.Read(ItemLoc, SizeOf(ItemLoc));
-      ItemLoc.ID := Swap(ItemLoc.ID);
-      ItemLoc.ConstructMethod := Swap(ItemLoc.ConstructMethod);
-      ItemLoc.BaseOffset := Swap(ItemLoc.BaseOffset);
-      ItemLoc.ExtentCount := Swap(ItemLoc.ExtentCount);
-      ItemLoc.Offset := SwapL(ItemLoc.Offset);
-      ItemLoc.Len := SwapL(ItemLoc.Len);
-
-      // Offset must be from start of file
-      if (ItemLoc.ConstructMethod <> 0) then
-        continue;
-
-      // Does this point to an Exif, or XMP?
-      // Save current position
-      SavPos := FotoF.Position;
-      try
-        FillChar(ExifOrXmpTag,  SizeOf(ExifOrXmpTag), 0);
-        FotoF.Seek(ItemLoc.Offset, TSeekOrigin.soBeginning);
-        FotoF.Read(ExifOrXmpTag, SizeOf(ExifOrXmpTag));
-
-        // Check Exif
-        if (SwapL(ExifOrXmpTag.TagLen) = 6) and
-           (ExifOrXmpTag.TagName = 'Exif') then
-        begin
-          Include(Supported,  TSupportedType.SupHEIC);
-          ExifIFDoffset := FotoF.Position;
-          FotoF.Read(result, SizeOf(result));
-        end;
-
-        // Check XMP
-        if (ExifOrXmpTag.XMpName = '<x:xmpmeta') then
-          AddXmpBlock(ItemLoc.Offset, ItemLoc.Len);
-      finally
-        // Restore file pointer
-        FotoF.Position := SavPos;
-      end;
-    end;
-  end;
-
+const
+  MoovSize = 24;
 var
   Tag: TFtypTag;
   Version: byte;
   Flags: array[0..2] of byte;
   EndPos: Int64;
-
-const
-  MoovSize = 24;
-
 begin
   result := WordData;
   FotoF.Seek(StartOffs, TSeekOrigin.soBeginning);
-  Fillchar(Tag, Sizeof(tag), 0);
+  Fillchar(Tag, SizeOf(Tag), 0);
 
   if (StartOffs = 0) then
   begin
@@ -2529,7 +2535,7 @@ begin
 
   FotoF.Seek(Tag.TagLen, TSeekOrigin.soCurrent);
   EndPos := FileSize;
-  while (FotoF.Position + SizeOf(Tag) <  EndPos) do
+  while (FotoF.Position + SizeOf(Tag) < EndPos) do
   begin
     FotoF.Read(Tag, SizeOf(Tag));
     Tag.TagLen := SwapL(Tag.TagLen) - SizeOf(Tag);
@@ -2541,7 +2547,7 @@ begin
     end
     else if (Tag.TagName = 'CMT1') then
     begin
-      Include(Supported,  TSupportedType.supCR3);
+      Include(Supported, TSupportedType.supCR3);
       FotoF.Read(result, SizeOf(result)); // Return first word.
       result := Swap(result);
       break;
@@ -2585,7 +2591,8 @@ begin
   if (Supported = [TSupportedType.SupHEIC]) then
   begin
     TIFFoffset := ExifIFDoffset;
-    ParseIfd(TIFFoffset + TiffHeaderLen, ParseIFD0);
+    if (TIFFoffset > 0) then
+      ParseIfd(TIFFoffset + TiffHeaderLen, ParseIFD0);
 
     // ParseIFD0 can set ExifIFDoffset/GPSoffset
     if ExifIFDoffset > 0 then
