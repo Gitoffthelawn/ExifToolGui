@@ -109,6 +109,7 @@ type
     LensInfo: string;
     LensMake: string;
     LensModel: string;
+    UserComment: string;
     ExifImageWidth: word;
     ExifImageHeight: word;
     procedure Clear;
@@ -271,7 +272,8 @@ type
     function AddXmp_Data(const AKey: string; AValue: TMetaInfo): TMetaInfo;
 
     function AdvanceNull:string;
-    function DecodeASCII(IFDentry: IFDentryRec; MaxLen: integer = 255): string;
+    function DecodeASCII(IFDentry: IFDentryRec): string;
+    function DecodeASCIIText(IFDentry: IFDentryRec): string;
     function DecodeWord(IFDentry: IFDentryRec): word;
     function DecodeRational(IFDentry: IFDentryRec): word;
     function DecodeExifLens(IFDentry: IFDentryRec): string;
@@ -353,7 +355,9 @@ uses
   SDJPegTypes;       // JPEG APP types
 
 var
-  Encoding: TEncoding;
+  Encoding_UTF8: TEncoding;
+  Encoding_UTF16LE: TEncoding;
+  Encoding_UTF16BE: TEncoding;
   GpsFormatSettings: TFormatSettings;  // for StrToFloatDef -see Initialization
   FAllInterFields: TStringList;
   FPentaxLenses: TStringList;
@@ -365,6 +369,19 @@ const
   ETD_AllInternalFields = 'ETD_AllInternalFields';
   ETD_PentaxLenses      = 'ETD_PentaxLenses';
 
+function ResetLength(const AStr: string): string;
+var
+  NulPos: integer;
+begin
+  result := AStr;
+  NulPos := Pos(#0, result);
+  case NulPos of
+    0:;
+    1: result := '-';
+    else
+      SetLength(result, NulPos -1);
+  end;
+end;
 
 procedure TTagSpec.GetKeyList(const AKeyList: TStringList;
                               const AMapGroups: TMapGroups;
@@ -952,36 +969,75 @@ begin
   end;
 end;
 
-function FotoRec.DecodeASCII(IFDentry: IFDentryRec; MaxLen: integer = 255): string;
+function FotoRec.DecodeASCII(IFDentry: IFDentryRec): string;
 var
   Bytes: TBytes;
-  W1: word;
-  L1: integer;
+  DirectValue: cardinal;
 begin
-  W1 := IFDentry.TypeCount - 1; // last byte is #0
-  SetLength(Bytes, W1);
-  L1 := IFDentry.ValueOffs;
-  if W1 > 3 then
+  result := '';
+  SetLength(Bytes, IFDentry.TypeCount);
+
+  // If IFDentry.TypeCount > SizeOf(IFDentry.ValueOffs), use as an offset
+  if (IFDentry.TypeCount > SizeOf(IFDentry.ValueOffs)) then
   begin
-    FotoF.Seek(TIFFoffset + L1, TSeekOrigin.soBeginning);
-    FotoF.Read(Bytes[0], W1);
+    FotoF.Seek(TIFFoffset + IFDentry.ValueOffs, TSeekOrigin.soBeginning);
+    FotoF.Read(Bytes[0], IFDentry.TypeCount);
   end
   else
   begin
+    // Use IFDentry.ValueOffs as the value.
+    // Strings <= 4 chars (including null byte!) EG: ABC#0
+    DirectValue := IFDentry.ValueOffs;
     if IsMM then
-      L1 := SwapL(L1);
-    Move(L1, Bytes[0], W1);
+      DirectValue := SwapL(DirectValue);
+    Move(DirectValue, Bytes[0], IFDentry.TypeCount);
   end;
+
+  if (Encoding_UTF8.GetCharCount(Bytes) > 0) then
+    result := ResetLength(Encoding_UTF8.GetString(Bytes));
+end;
+
+function FotoRec.DecodeASCIIText(IFDentry: IFDentryRec): string;
+const
+  IdLen = 8;
+var
+  Id: string;
+  Bytes: TBytes;
+begin
   result := '';
-  if (Encoding.GetCharCount(Bytes) > 0) then
+  if (IFDentry.TypeCount <= IdLen) then
+    exit;
+
+  FotoF.Seek(TIFFoffset + IFDentry.ValueOffs, TSeekOrigin.soBeginning);
+
+  // Read the ID
+  SetLength(Bytes, IdLen);
+  FotoF.Read(Bytes[0], IdLen);
+  if (Encoding_UTF8.GetCharCount(Bytes) = 0) then
+    exit;
+  Id := ResetLength(Encoding_UTF8.GetString(Bytes));
+
+  // Read the Value
+  SetLength(Bytes, IFDentry.TypeCount - IdLen);
+  FotoF.Read(Bytes[0], IFDentry.TypeCount - IdLen);
+
+  // ASCII (=UTF8)
+  if (SameText('ASCII', Id)) and
+     (Encoding_UTF8.GetCharCount(Bytes) > 0) then
+    exit(ResetLength(Encoding_UTF8.GetString(Bytes)));
+
+  // UNICODE (=UTF16LE or UTF16BE)
+  if (SameText('UNICODE', Id)) then
   begin
-    result := Encoding.GetString(Bytes);
-    L1 := Pos(#0, result);
-    case L1 of
-      0:;
-      1: result := '-'; // in case tag is defined and empty
-      else
-         SetLength(result, L1 -1);
+    if IsMM then
+    begin
+      if (Encoding_UTF16BE.GetCharCount(Bytes) > 0) then
+        exit(ResetLength(Encoding_UTF16BE.GetString(Bytes)));
+    end
+    else
+    begin
+      if (Encoding_UTF16LE.GetCharCount(Bytes) > 0) then
+        exit(ResetLength(Encoding_UTF16LE.GetString(Bytes)));
     end;
   end;
 end;
@@ -1219,8 +1275,8 @@ begin
   SetLength(Bytes, IPTCtagSz);
   FotoF.Read(Bytes[0], IPTCtagSz);
   Tx := '';
-  if (Encoding.GetCharCount(Bytes) > 0) then
-    Tx := Encoding.GetString(Bytes);
+  if (Encoding_UTF8.GetCharCount(Bytes) > 0) then
+    Tx := Encoding_UTF8.GetString(Bytes);
   Dec(IPTCsize, IPTCtagSz);
   with IPTC do
   begin
@@ -1291,7 +1347,7 @@ begin
   begin
     HasData := true;
     case IFDentry.Tag of
-      $95: LensType := AddMakerNotesData('LensType', DecodeASCII(IFDentry, 64));
+      $95: LensType := AddMakerNotesData('LensType', DecodeASCII(IFDentry));
     end;
   end;
   FotoF.Seek(SavePos, TSeekOrigin.soBeginning);
@@ -1372,11 +1428,11 @@ begin
       $002E:
         JPGfromRAWoffset := IFDentry.ValueOffs; // Panasonic RW2
       $010E:
-        ImageDescription := AddIfd0Data('ImageDescription', DecodeASCII(IFDentry, 64));
+        ImageDescription := AddIfd0Data('ImageDescription', DecodeASCII(IFDentry));
       $010F:
-        Make := AddIfd0Data('Make', DecodeASCII(IFDentry, 64));
+        Make := AddIfd0Data('Make', DecodeASCII(IFDentry));
       $0110:
-        Model := AddIfd0Data('Model', DecodeASCII(IFDentry, 64));
+        Model := AddIfd0Data('Model', DecodeASCII(IFDentry));
       $0111:
         PreviewOffset := IFDentry.ValueOffs;
       $0112:
@@ -1413,15 +1469,15 @@ begin
           AddIfd0Data('ResolutionUnit', ResolutionUnit);
         end;
       $0131:
-        Software := AddIfd0Data('Software', DecodeASCII(IFDentry, 64));
+        Software := AddIfd0Data('Software', DecodeASCII(IFDentry));
       $0132:
         DateTimeModify := AddIfd0Data('DateTimeModify', DecodeASCII(IFDentry));
       $013B:
-        Artist := AddIfd0Data('Artist', DecodeASCII(IFDentry, 64));
+        Artist := AddIfd0Data('Artist', DecodeASCII(IFDentry));
       $02BC:
           AddXmpBlock(IFDentry.ValueOffs + TIFFoffset, IFDentry.TypeCount);
       $8298:
-        Copyright := AddIfd0Data('Copyright', DecodeASCII(IFDentry, 64));
+        Copyright := AddIfd0Data('Copyright', DecodeASCII(IFDentry));
       $83BB:
         begin
           if IFDentry.FieldType = 1 then
@@ -1514,6 +1570,8 @@ begin
         end;
       $920A:
         FocalLength := AddExifIFDData('FocalLength', FormatExifDecimal(GetRational(IFDentry), 1));
+      $9286:
+        UserComment := AddExifIFDData('UserComment', DecodeASCIIText(IFDentry));
       $A001:
         begin
           case DecodeWord(IFDentry) of
@@ -1550,9 +1608,9 @@ begin
       $A432:
         LensInfo := AddExifIFDData('LensInfo', DecodeExifLens(IFDentry));
       $A433:
-        LensMake := AddExifIFDData('LensMake', DecodeASCII(IFDentry, 23));
+        LensMake := AddExifIFDData('LensMake', DecodeASCII(IFDentry));
       $A434:
-        LensModel := AddExifIFDData('LensModel', DecodeASCII(IFDentry, 47));
+        LensModel := AddExifIFDData('LensModel', DecodeASCII(IFDentry));
       $C634,
       $927C: // MakerNotes
         MakerNotesOffset := IFDentry.ValueOffs;
@@ -2870,13 +2928,17 @@ begin
   GpsFormatSettings.ThousandSeparator := '.';
   GpsFormatSettings.DecimalSeparator := ',';
 
-  Encoding := TEncoding.GetEncoding(CP_UTF8);
+  Encoding_UTF8 := TEncoding.GetEncoding(CP_UTF8);
+  Encoding_UTF16LE := TUnicodeEncoding.Create;
+  Encoding_UTF16BE := TBigEndianUnicodeEncoding.Create;
 end;
 
 finalization
 
 begin
-  Encoding.Free;
+  Encoding_UTF8.Free;
+  Encoding_UTF16LE.Free;
+  Encoding_UTF16BE.Free;
   FAllInterFields.Free;
   FPentaxLenses.Free;
   FGroups0.Free;
