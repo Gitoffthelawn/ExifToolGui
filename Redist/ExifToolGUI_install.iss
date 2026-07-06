@@ -6,7 +6,8 @@
 #define ExifToolGUIPublisher "FrankB"
 ; URl's
 #define ExifToolGUIUpdatesURL "https://github.com/FrankBijnen/ExifToolGui/releases"
-#define PHUrl "https://exiftool.org/"
+#define PHUrl_Org "https://exiftool.org/"
+#define PHUrl_SF "https://downloads.sourceforge.net/project/exiftool/"
 #define OBetzUrl "https://oliverbetz.de/cms/files/Artikel/ExifTool-for-Windows/"
 ; _32 or _64
 #define ETPlatform "{code:Platform}"
@@ -43,11 +44,11 @@
 #define TaskPH "PH"
 #define TaskOBETZ "OBETZ"
 #define DownloadExifToolAutoPH DownloadExifToolAuto + BackSlash + TaskPH
-#define DownloadExifToolAutoOBETZ DownloadExifToolAuto + BackSlash+ TaskOBETZ
-#define ByPhilHarvey "By Phil Harvey (" + PHUrl + ")"
+#define DownloadExifToolAutoOBETZ DownloadExifToolAuto + BackSlash + TaskOBETZ
+#define ByPhilHarvey "By Phil Harvey (" + PHUrl_SF + ")"
 #define ByOliverBetz "By Oliver Betz (" + OBetzUrl + ")"
 #define DownloadGeoDB "DownloadGeoDB" 
-#define DownloadGeoDBDesc "Download alternate (larger) GeoLocation database."
+#define DownloadGeoDBDesc "Alternate (larger) GeoLocation DB. (" + PHUrl_Org + ")" 
 #define GeoLocationDir "Geolocation500"
 ;
 #define AddToPath "AddToPath"
@@ -199,7 +200,8 @@ const
   OBETZINSTALL              = 'ExifTool_install';
 
   // Constants for Phil Harvey's ExifTool
-  PHURL                     = '{#PHUrl}';
+  PHURL_Org                 = '{#PHUrl_Org}';
+  PHURL_SF                  = '{#PHUrl_SF}';
   VER_TXT                   = 'ver.txt';
   ZIP                       = '.zip';
   EXE                       = '.exe';
@@ -527,7 +529,7 @@ begin
     if (WizardForm.TasksList.ItemCaption[I] = ExpandConstant('{#ByPhilHarvey}')) then
     begin
       if (ETVerPH = '') then
-        ETVerPH := GetCurrentVersion(PHURL + VER_TXT);
+        ETVerPH := GetCurrentVersion(PHURL_Org + VER_TXT);
       WizardForm.TasksList.ItemCaption[I] := WizardForm.TasksList.ItemCaption[I] + ' Available: ' + ConvertToString(ETVerPH);
     end;
     if (WizardForm.TasksList.ItemCaption[I] = ExpandConstant('{#ByOliverBetz}')) then
@@ -539,7 +541,7 @@ begin
     if (WizardForm.TasksList.ItemCaption[I] = ExpandConstant('{#DownloadGeoDBDesc}')) then
     begin
       if (AlternateDBVer = '') then
-        AlternateDBVer := GetCurrentVersion(PHURL + GEODBVER);
+        AlternateDBVer := GetCurrentVersion(PHURL_Org + GEODBVER);
       WizardForm.TasksList.ItemCaption[I] := WizardForm.TasksList.ItemCaption[I] + ' Available: ' + AlternateDBVer;
     end;
   end;
@@ -723,7 +725,7 @@ function DownloadETPH: boolean;
 var
   ETDir: AnsiString;
 begin
-  ETFile := PHURL + ETZipFile('') + ZIP;
+  ETFile := PHURL_Sf + ETZipFile('') + ZIP;
   
   if (NeverDownload) then
   begin
@@ -765,7 +767,7 @@ end;
 
 function DownloadAltDb: boolean;
 begin
-  DBFile := PHURL + AlternateDB('');
+  DBFile := PHURL_Org + AlternateDB('');
   if (NeverDownload) then
   begin
     result := true;
